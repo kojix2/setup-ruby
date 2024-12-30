@@ -1,6 +1,8 @@
 // 7z arguments
 //   -aoa overwrite existing, -bd disable progress indicator
 
+// OpenSSL version detection is needed in installGCCTools and installJRubyTools
+
 const fs = require('fs')
 const path = require('path')
 const cp = require('child_process')
@@ -18,20 +20,20 @@ const msys2GCCReleaseURI  = 'https://github.com/ruby/setup-msys2-gcc/releases/do
 const msys2BasePath = process.env['GHCUP_MSYS2']
 const vcPkgBasePath = process.env['VCPKG_INSTALLATION_ROOT']
 
-// needed for Ruby 2.0-2.3, and mswin, cert file used by Git for Windows
-const certFile = 'C:\\Program Files\\Git\\mingw64\\ssl\\cert.pem'
+// needed for Ruby 2.0-2.3, cert file used by Git for Windows
+let certFile = 'C:\\Program Files\\Git\\mingw64\\etc\\ssl\\cert.pem'
+if (!fs.existsSync(certFile)) {
+  certFile = 'C:\\Program Files\\Git\\mingw64\\ssl\\cert.pem'
+  if (!fs.existsSync(certFile)) {
+    throw new Error("Cannot find Git's cert file")
+  }
+}
 
 // location & path for old RubyInstaller DevKit (MSYS1), used with Ruby 2.0-2.3
 const msys1 = `${drive}:\\DevKit64`
 const msysPathEntries = [`${msys1}\\mingw\\x86_64-w64-mingw32\\bin`, `${msys1}\\mingw\\bin`, `${msys1}\\bin`]
 
-const virtualEnv = common.getVirtualEnvironmentName()
-
 export function getAvailableVersions(platform, engine) {
-  if (!common.supportedPlatforms.includes(platform)) {
-    throw new Error(`Unsupported platform ${platform}`)
-  }
-
   if (engine === 'ruby') {
     return Object.keys(rubyInstallerVersions)
   } else {
@@ -44,7 +46,7 @@ export async function install(platform, engine, version) {
 
   // The windows-2016 and windows-2019 images have MSYS2 build tools (C:/msys64/usr)
   // and MinGW build tools installed.  The windows-2022 image has neither.
-  const hasMSYS2PreInstalled = ['windows-2019', 'windows-2016'].includes(virtualEnv)
+  const hasMSYS2PreInstalled = ['windows-2019', 'windows-2016'].includes(platform)
 
   if (!url.endsWith('.7z')) {
     throw new Error(`URL should end in .7z: ${url}`)
@@ -53,22 +55,27 @@ export async function install(platform, engine, version) {
 
   let rubyPrefix, inToolCache
   if (common.shouldUseToolCache(engine, version)) {
-    inToolCache = tc.find('Ruby', version)
+    inToolCache = common.toolCacheFind(engine, version)
     if (inToolCache) {
       rubyPrefix = inToolCache
     } else {
-      rubyPrefix = common.getToolCacheRubyPrefix(platform, version)
+      rubyPrefix = common.getToolCacheRubyPrefix(platform, engine, version)
     }
   } else {
     rubyPrefix = `${drive}:\\${base}`
   }
 
-  let toolchainPaths = (version === 'mswin') ? await setupMSWin() : await setupMingw(version)
-
   if (!inToolCache) {
     await downloadAndExtract(engine, version, url, base, rubyPrefix);
   }
 
+  const windowsToolchain = core.getInput('windows-toolchain')
+  if (windowsToolchain === 'none') {
+    common.setupPath([`${rubyPrefix}\\bin`])
+    return rubyPrefix
+  }
+
+  let toolchainPaths = (version === 'mswin') ? await setupMSWin() : await setupMingw(version)
   const msys2Type = common.setupPath([`${rubyPrefix}\\bin`, ...toolchainPaths])
 
   // install msys2 tools for all Ruby versions, only install mingw or ucrt for Rubies >= 2.4
@@ -80,7 +87,7 @@ export async function install(platform, engine, version) {
   // windows 2016 and 2019 need ucrt64 installed, 2022 and future images need
   // ucrt64 or mingw64 installed, depending on Ruby version
   if (((msys2Type === 'ucrt64') || !hasMSYS2PreInstalled) && common.floatVersion(version) >= 2.4) {
-    await installGCCTools(msys2Type)
+    await installGCCTools(msys2Type, version)
   }
 
   if (version === 'mswin') {
@@ -97,14 +104,24 @@ export async function install(platform, engine, version) {
 
 // Actions windows-2022 image does not contain any mingw or ucrt build tools.  Install tools for it,
 // and also install ucrt tools on earlier versions, which have msys2 and mingw tools preinstalled.
-async function installGCCTools(type) {
-  const downloadPath = await common.measure(`Downloading ${type} build tools`, async () => {
-    let url = `${msys2GCCReleaseURI}/msys2-gcc-pkgs/${type}.7z`
+async function installGCCTools(type, version) {
+  // 2022-Dec ruby/msys2-gcc-pkgs now uses a suffix to delineate different archive versions.
+  // At present, the only use is to indicate the included OpenSSL version.
+  // With no suffix, archives include OpenSSL 1.1.1, with a '-3.0' suffix, they include
+  // OpenSSL 3.0.x.  Note that the mswin archive uses OpenSSL 3.
+  // As of Jan-2023, OpenSSL 3 is used in Ruby 3.2 & all head versions.  MSYS2 updated
+  // to OpenSSL 3 on 14-Jan-2023.
+  let suffix = ''
+  if (common.isHeadVersion(version) || common.floatVersion(version) >= 3.2) {
+    suffix = '-3.0'
+  }
+  const downloadPath = await common.measure(`Downloading ${type}${suffix} build tools`, async () => {
+    let url = `${msys2GCCReleaseURI}/msys2-gcc-pkgs/${type}${suffix}.7z`
     console.log(url)
     return await tc.downloadTool(url)
   })
 
-  await common.measure(`Extracting  ${type} build tools`, async () =>
+  await common.measure(`Extracting  ${type}${suffix} build tools`, async () =>
     exec.exec('7z', ['x', downloadPath, '-aoa', '-bd', `-o${msys2BasePath}`], { silent: true }))
 }
 
@@ -129,7 +146,8 @@ async function installMSYS2Tools() {
 // windows-2022 and later images
 export async function installJRubyTools() {
   await installMSYS2Tools()
-  await installGCCTools('mingw64')
+  // Will need to add OpenSSL version detection when JRuby uses OpenSSL 3.0 ?
+  await installGCCTools('mingw64', '2.7')
 }
 
 // Install vcpkg files needed to build mswin Ruby
@@ -199,29 +217,6 @@ async function installMSYS1(version) {
 
 async function setupMSWin() {
   core.exportVariable('MAKE', 'nmake.exe')
-
-  // Pre-installed OpenSSL use C:\Program Files\Common Files\SSL
-  let certsDir = 'C:\\Program Files\\Common Files\\SSL\\certs'
-  if (!fs.existsSync(certsDir)) {
-    fs.mkdirSync(certsDir, { recursive: true })
-  }
-
-  // cert.pem location is hard-coded by OpenSSL msvc builds
-  let cert = 'C:\\Program Files\\Common Files\\SSL\\cert.pem'
-  if (!fs.existsSync(cert)) {
-    fs.copyFileSync(certFile, cert)
-  }
-
-  // vcpkg openssl uses packages\openssl_x64-windows\certs
-  certsDir = `${vcPkgBasePath}\\packages\\openssl_x64-windows\\certs`
-  if (!fs.existsSync(certsDir)) {
-    fs.mkdirSync(certsDir, { recursive: true })
-  }
-
-  // vcpkg openssl uses packages\openssl_x64-windows\cert.pem
-  cert = `${vcPkgBasePath}\\packages\\openssl_x64-windows\\cert.pem`
-  fs.copyFileSync(certFile, cert)
-
   return await common.measure('Setting up MSVC environment', async () => addVCVARSEnv())
 }
 

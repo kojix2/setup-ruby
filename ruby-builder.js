@@ -1,6 +1,7 @@
 const os = require('os')
 const fs = require('fs')
 const path = require('path')
+const core = require('@actions/core')
 const exec = require('@actions/exec')
 const io = require('@actions/io')
 const tc = require('@actions/tool-cache')
@@ -13,28 +14,31 @@ const releasesURL = 'https://github.com/ruby/ruby-builder/releases'
 const windows = common.windows
 
 export function getAvailableVersions(platform, engine) {
-  if (!common.supportedPlatforms.includes(platform)) {
-    throw new Error(`Unsupported platform ${platform}`)
-  }
-
-  if (platform === 'ubuntu-22.04') {
-    const rubyVersions = rubyBuilderVersions['ruby']
-    return {
-      ruby: rubyVersions.slice(rubyVersions.indexOf('3.1.0')),
-    }[engine]
-  }
-
   return rubyBuilderVersions[engine]
 }
 
 export async function install(platform, engine, version) {
   let rubyPrefix, inToolCache
   if (common.shouldUseToolCache(engine, version)) {
-    inToolCache = tc.find('Ruby', version)
+    inToolCache = common.toolCacheFind(engine, version)
     if (inToolCache) {
       rubyPrefix = inToolCache
     } else {
-      rubyPrefix = common.getToolCacheRubyPrefix(platform, version)
+      const toolCacheRubyPrefix = common.getToolCacheRubyPrefix(platform, engine, version)
+      if (common.isSelfHostedRunner()) {
+        const rubyBuildDefinition = engine === 'ruby' ? version : `${engine}-${version}`
+        core.error(
+          `The current runner (${common.getOSNameVersionArch()}) was detected as self-hosted because ${common.selfHostedRunnerReason()}.\n` +
+          `In such a case, you should install Ruby in the $RUNNER_TOOL_CACHE yourself, for example using https://github.com/rbenv/ruby-build\n` +
+          `You can take inspiration from this workflow for more details: https://github.com/ruby/ruby-builder/blob/master/.github/workflows/build.yml\n` +
+          `$ ruby-build ${rubyBuildDefinition} ${toolCacheRubyPrefix}\n` +
+          `Once that completes successfully, mark it as complete with:\n` +
+          `$ touch ${common.toolCacheCompleteFile(toolCacheRubyPrefix)}\n` +
+          `It is your responsibility to ensure installing Ruby like that is not done in parallel.\n`)
+        process.exit(1)
+      } else {
+        rubyPrefix = toolCacheRubyPrefix
+      }
     }
   } else if (windows) {
     rubyPrefix = path.join(`${common.drive}:`, `${engine}-${version}`)
@@ -46,39 +50,11 @@ export async function install(platform, engine, version) {
   common.setupPath([path.join(rubyPrefix, 'bin')])
 
   if (!inToolCache) {
-    await preparePrefix(rubyPrefix)
-    if (engine === 'truffleruby+graalvm') {
-      await installWithRubyBuild(engine, version, rubyPrefix)
-    } else {
-      await downloadAndExtract(platform, engine, version, rubyPrefix)
-    }
+    await io.mkdirP(rubyPrefix)
+    await downloadAndExtract(platform, engine, version, rubyPrefix)
   }
 
   return rubyPrefix
-}
-
-async function preparePrefix(rubyPrefix) {
-  const parentDir = path.dirname(rubyPrefix)
-
-  await io.rmRF(rubyPrefix)
-  if (!(fs.existsSync(parentDir) && fs.statSync(parentDir).isDirectory())) {
-    await io.mkdirP(parentDir)
-  }
-}
-
-async function installWithRubyBuild(engine, version, rubyPrefix) {
-  const tmp = process.env['RUNNER_TEMP'] || os.tmpdir()
-  const rubyBuildDir = path.join(tmp, 'ruby-build-for-setup-ruby')
-  await common.measure('Cloning ruby-build', async () => {
-    await exec.exec('git', ['clone', 'https://github.com/rbenv/ruby-build.git', rubyBuildDir])
-  })
-
-  const rubyName = `${engine}-${version === 'head' ? 'dev' : version}`
-  await common.measure(`Installing ${engine}-${version} with ruby-build`, async () => {
-    await exec.exec(`${rubyBuildDir}/bin/ruby-build`, [rubyName, rubyPrefix])
-  })
-
-  await io.rmRF(rubyBuildDir)
 }
 
 async function downloadAndExtract(platform, engine, version, rubyPrefix) {
@@ -87,7 +63,17 @@ async function downloadAndExtract(platform, engine, version, rubyPrefix) {
   const downloadPath = await common.measure('Downloading Ruby', async () => {
     const url = getDownloadURL(platform, engine, version)
     console.log(url)
-    return await tc.downloadTool(url)
+    try {
+      return await tc.downloadTool(url)
+    } catch (error) {
+      if (error.message.includes('404')) {
+        throw new Error(`Unavailable version ${version} for ${engine} on ${platform}
+          You can request it at https://github.com/ruby/setup-ruby/issues
+          Cause: ${error.message}`)
+      } else {
+        throw error
+      }
+    }
   })
 
   await common.measure('Extracting  Ruby', async () => {
@@ -106,10 +92,14 @@ async function downloadAndExtract(platform, engine, version, rubyPrefix) {
 
 function getDownloadURL(platform, engine, version) {
   let builderPlatform = platform
-  if (platform.startsWith('windows-')) {
+  if (platform.startsWith('windows-') && os.arch() === 'x64') {
     builderPlatform = 'windows-latest'
   } else if (platform.startsWith('macos-')) {
-    builderPlatform = 'macos-latest'
+    if (os.arch() === 'x64') {
+      builderPlatform = 'macos-latest'
+    } else if (os.arch() === 'arm64') {
+      builderPlatform = 'macos-13-arm64'
+    }
   }
 
   if (common.isHeadVersion(version)) {
@@ -120,5 +110,9 @@ function getDownloadURL(platform, engine, version) {
 }
 
 function getLatestHeadBuildURL(platform, engine, version) {
-  return `https://github.com/ruby/${engine}-dev-builder/releases/latest/download/${engine}-${version}-${platform}.tar.gz`
+  var repo = `${engine}-dev-builder`
+  if (engine === 'truffleruby+graalvm') {
+    repo = 'truffleruby-dev-builder'
+  }
+  return `https://github.com/ruby/${repo}/releases/latest/download/${engine}-${version}-${platform}.tar.gz`
 }

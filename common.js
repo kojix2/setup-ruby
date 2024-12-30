@@ -5,11 +5,17 @@ const util = require('util')
 const stream = require('stream')
 const crypto = require('crypto')
 const core = require('@actions/core')
+const tc = require('@actions/tool-cache')
 const { performance } = require('perf_hooks')
+const linuxOSInfo = require('linux-os-info')
 
 export const windows = (os.platform() === 'win32')
 // Extract to SSD on Windows, see https://github.com/ruby/setup-ruby/pull/14
 export const drive = (windows ? (process.env['GITHUB_WORKSPACE'] || 'C')[0] : undefined)
+
+export const inputs = {
+  selfHosted: undefined
+}
 
 export function partition(string, separator) {
   const i = string.indexOf(separator)
@@ -47,16 +53,44 @@ export async function measure(name, block) {
   }
 }
 
-export function isHeadVersion(rubyVersion) {
-  return ['head', 'debug',  'mingw', 'mswin', 'ucrt'].includes(rubyVersion)
+// Same as mesaure() but without the group, and no time shown on error
+export async function time(name, block) {
+  console.log(`> ${name}`)
+  const start = performance.now()
+  const value = await block()
+  const end = performance.now()
+
+  const duration = (end - start) / 1000.0
+  console.log(`Took ${duration.toFixed(2).padStart(6)} seconds`)
+  return value
 }
 
-export function isStableVersion(rubyVersion) {
-  return /^\d+(\.\d+)*$/.test(rubyVersion)
+export function isHeadVersion(rubyVersion) {
+  return ['head', 'debug',  'mingw', 'mswin', 'ucrt', 'asan'].includes(rubyVersion)
+}
+
+export function isStableVersion(engine, rubyVersion) {
+  if (engine.startsWith('truffleruby')) {
+    return /^\d+(\.\d+)*(-preview\d+)?$/.test(rubyVersion)
+  } else {
+    return /^\d+(\.\d+)*$/.test(rubyVersion)
+  }
+}
+
+export function hasBundlerDefaultGem(engine, rubyVersion) {
+  return isBundler1Default(engine, rubyVersion) || isBundler2Default(engine, rubyVersion)
 }
 
 export function isBundler1Default(engine, rubyVersion) {
-  return !isBundler2Default(engine, rubyVersion)
+  if (engine === 'ruby') {
+    return floatVersion(rubyVersion) >= 2.6 && floatVersion(rubyVersion) < 2.7
+  } else if (engine.startsWith('truffleruby')) {
+    return floatVersion(rubyVersion) < 21.0
+  } else if (engine === 'jruby') {
+    return false
+  } else {
+    return false
+  }
 }
 
 export function isBundler2Default(engine, rubyVersion) {
@@ -69,6 +103,43 @@ export function isBundler2Default(engine, rubyVersion) {
   } else {
     return false
   }
+}
+
+export function isBundler2dot2Default(engine, rubyVersion) {
+  if (engine === 'ruby') {
+    return floatVersion(rubyVersion) >= 3.0
+  } else if (engine.startsWith('truffleruby')) {
+    return floatVersion(rubyVersion) >= 22.0
+  } else if (engine === 'jruby') {
+    return floatVersion(rubyVersion) >= 9.3
+  } else {
+    return false
+  }
+}
+
+export function targetRubyVersion(engine, rubyVersion) {
+  const version = floatVersion(rubyVersion)
+  if (engine === 'ruby') {
+    return version
+  } else if (engine === 'jruby') {
+    if (version === 9.1) {
+      return 2.3
+    } else if (version === 9.2) {
+      return 2.5
+    } else if (version === 9.3) {
+      return 2.6
+    }
+  } else if (engine.startsWith('truffleruby')) {
+    if (version < 21.0) {
+      return 2.6
+    } else if (version < 22.0) {
+      return 2.7
+    } else if (version < 23.0) {
+      return 3.0
+    }
+  }
+
+  return 9.9 // unknown, assume recent
 }
 
 export function floatVersion(rubyVersion) {
@@ -90,75 +161,179 @@ export async function hashFile(file) {
   return hash.digest('hex')
 }
 
-function getImageOS() {
-  const imageOS = process.env['ImageOS']
-  if (!imageOS) {
-    throw new Error('The environment variable ImageOS must be set')
-  }
-  return imageOS
-}
-
-export const supportedPlatforms = [
-  'ubuntu-18.04',
-  'ubuntu-20.04',
-  'ubuntu-22.04',
-  'macos-10.15',
-  'macos-11',
-  'macos-12',
-  'windows-2019',
-  'windows-2022',
+// macos is not listed explicitly, see below
+const GitHubHostedPlatforms = [
+  'ubuntu-20.04-x64',
+  'ubuntu-22.04-x64',
+  'ubuntu-24.04-x64',
+  'windows-2019-x64',
+  'windows-2022-x64',
 ]
 
-export function getVirtualEnvironmentName() {
-  const imageOS = getImageOS()
+// Precisely: whether we have builds for that platform and there are GitHub-hosted runners to test it
+function isSupportedPlatform() {
+  const platform = getOSName()
+  switch (platform) {
+    case 'ubuntu':
+      return GitHubHostedPlatforms.includes(getOSNameVersionArch())
+    case 'macos':
+      // See https://github.com/ruby/ruby-builder/blob/master/README.md#naming
+      // 13 on arm64 because of old macos-arm-oss runners
+      return (os.arch() === 'x64' && parseInt(getOSVersion()) >= 13) ||
+          (os.arch() === 'arm64' && parseInt(getOSVersion()) >= 13)
+    case 'windows':
+      return GitHubHostedPlatforms.includes(getOSNameVersionArch())
+  }
+}
 
-  let match = imageOS.match(/^ubuntu(\d+)/) // e.g. ubuntu18
-  if (match) {
-    return `ubuntu-${match[1]}.04`
+// Actually a self-hosted runner for which the OS and OS version does not correspond to a GitHub-hosted runner image,
+export function isSelfHostedRunner() {
+  if (inputs.selfHosted === undefined) {
+    throw new Error('inputs.selfHosted should have been already set')
   }
 
-  match = imageOS.match(/^macos(\d{2})(\d+)?/) // e.g. macos1015, macos11
-  if (match) {
-    if (match[2]) {
-      return `macos-${match[1]}.${match[2]}`
-    } else {
-      return `macos-${match[1]}`
-    }
+  return inputs.selfHosted === 'true' || !isSupportedPlatform()
+}
+
+export function selfHostedRunnerReason() {
+  if (inputs.selfHosted === 'true') {
+    return 'the self-hosted input was set'
+  } else if (!isSupportedPlatform()) {
+    return 'the platform does not match a GitHub-hosted runner image (or that image is deprecated and no longer supported)'
+  } else {
+    return 'unknown reason'
+  }
+}
+
+let osName = undefined
+let osVersion = undefined
+
+export function getOSName() {
+  if (osName !== undefined) {
+    return osName
   }
 
-  match = imageOS.match(/^win(\d+)/) // e.g. win19
-  if (match) {
-    return `windows-20${match[1]}`
+  const platform = os.platform()
+  if (platform === 'linux') {
+    const info = linuxOSInfo({mode: 'sync'})
+    osName = info.id
+  } else if (platform === 'darwin') {
+    osName = 'macos'
+  } else if (platform === 'win32') {
+    osName = 'windows'
+  } else {
+    throw new Error(`Unknown platform ${platform}`)
   }
 
-  throw new Error(`Unknown ImageOS ${imageOS}`)
+  return osName
+}
+
+export function getOSVersion() {
+  if (osVersion !== undefined) {
+    return osVersion
+  }
+
+  const platform = os.platform()
+  if (platform === 'linux') {
+    const info = linuxOSInfo({mode: 'sync'})
+    osVersion = info.version_id
+  } else if (platform === 'darwin') {
+    // See https://github.com/sindresorhus/macos-release/blob/main/index.js
+    const darwinVersion = parseInt(os.release().match(/^\d+/)[0])
+    osVersion = `${darwinVersion - 9}`
+  } else if (platform === 'win32') {
+    osVersion = findWindowsVersion()
+  } else {
+    throw new Error(`Unknown platform ${platform}`)
+  }
+
+  return osVersion
+}
+
+export function getOSNameVersion() {
+  return `${getOSName()}-${getOSVersion()}`
+}
+
+export function getOSNameVersionArch() {
+  return `${getOSName()}-${getOSVersion()}-${os.arch()}`
+}
+
+function findWindowsVersion() {
+  const version = os.version()
+  const match = version.match(/^Windows Server (\d+) Datacenter/)
+  if (match) {
+    return match[1]
+  } else {
+    throw new Error('Could not find Windows version')
+  }
 }
 
 export function shouldUseToolCache(engine, version) {
-  return engine === 'ruby' && !isHeadVersion(version)
+  return (engine === 'ruby' && !isHeadVersion(version)) || isSelfHostedRunner()
 }
 
-function getPlatformToolCache(platform) {
-  // Hardcode paths rather than using $RUNNER_TOOL_CACHE because the prebuilt Rubies cannot be moved anyway
-  if (platform.startsWith('ubuntu-')) {
-    return '/opt/hostedtoolcache'
-  } else if (platform.startsWith('macos-')) {
-    return '/Users/runner/hostedtoolcache'
-  } else if (platform.startsWith('windows-')) {
-    return 'C:/hostedtoolcache/windows'
+export function getToolCachePath() {
+  if (isSelfHostedRunner()) {
+    return getRunnerToolCache()
   } else {
-    throw new Error('Unknown platform')
+    // Rubies prebuilt by this action embed this path rather than using $RUNNER_TOOL_CACHE
+    // so use that path if not isSelfHostedRunner()
+    return getDefaultToolCachePath()
   }
 }
 
-export function getToolCacheRubyPrefix(platform, version) {
-  const toolCache = getPlatformToolCache(platform)
-  return path.join(toolCache, 'Ruby', version, 'x64')
+export function getRunnerToolCache() {
+  const runnerToolCache = process.env['RUNNER_TOOL_CACHE']
+  if (!runnerToolCache) {
+    throw new Error('$RUNNER_TOOL_CACHE must be set')
+  }
+  return runnerToolCache
+}
+
+// Rubies prebuilt by this action embed this path rather than using $RUNNER_TOOL_CACHE
+function getDefaultToolCachePath() {
+  const platform = getOSName()
+  switch (platform) {
+    case 'ubuntu':
+      return '/opt/hostedtoolcache'
+    case 'macos':
+      return '/Users/runner/hostedtoolcache'
+    case 'windows':
+      return 'C:\\hostedtoolcache\\windows'
+  }
+}
+
+// tc.find() but using RUNNER_TOOL_CACHE=getToolCachePath()
+export function toolCacheFind(engine, version) {
+  const originalToolCache = getToolCachePath()
+  process.env['RUNNER_TOOL_CACHE'] = getToolCachePath()
+  try {
+    return tc.find(engineToToolCacheName(engine), version)
+  } finally {
+    process.env['RUNNER_TOOL_CACHE'] = originalToolCache
+  }
+}
+
+function engineToToolCacheName(engine) {
+  return {
+    ruby: 'Ruby',
+    jruby: 'JRuby',
+    truffleruby: 'TruffleRuby',
+    "truffleruby+graalvm": 'TruffleRubyGraalVM'
+  }[engine]
+}
+
+export function getToolCacheRubyPrefix(platform, engine, version) {
+  const toolCache = getToolCachePath()
+  return path.join(toolCache, engineToToolCacheName(engine), version, os.arch())
+}
+
+export function toolCacheCompleteFile(toolCacheRubyPrefix) {
+  return `${toolCacheRubyPrefix}.complete`
 }
 
 export function createToolCacheCompleteFile(toolCacheRubyPrefix) {
-  const completeFile = `${toolCacheRubyPrefix}.complete`
-  fs.writeFileSync(completeFile, '')
+  fs.writeFileSync(toolCacheCompleteFile(toolCacheRubyPrefix), '')
 }
 
 // convert windows path like C:\Users\runneradmin to /c/Users/runneradmin
@@ -198,7 +373,8 @@ export function setupPath(newPathEntries) {
 
   // Then add new path entries using core.addPath()
   let newPath
-  if (windows) {
+  const windowsToolchain = core.getInput('windows-toolchain')
+  if (windows && windowsToolchain !== 'none') {
     // main Ruby dll determines whether mingw or ucrt build
     msys2Type = rubyIsUCRT(newPathEntries[0]) ? 'ucrt64' : 'mingw64'
 

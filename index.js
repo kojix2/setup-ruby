@@ -12,10 +12,12 @@ const windows = common.windows
 const inputDefaults = {
   'ruby-version': 'default',
   'rubygems': 'default',
-  'bundler': 'default',
+  'bundler': 'Gemfile.lock',
   'bundler-cache': 'false',
   'working-directory': '.',
   'cache-version': bundler.DEFAULT_CACHE_VERSION,
+  'self-hosted': 'false',
+  'windows-toolchain': 'default',
 }
 
 // entry point when this action is run on its own
@@ -23,8 +25,15 @@ export async function run() {
   try {
     await setupRuby()
   } catch (error) {
-    core.setFailed(error.stack)
+    if (/\bprocess\b.+\bfailed\b/.test(error.message)) {
+      core.setFailed(error.message)
+    } else {
+      core.setFailed(error.stack)
+    }
   }
+  // Explicit process.exit() to not wait hanging promises,
+  // see https://github.com/ruby/setup-ruby/issues/543
+  process.exit()
 }
 
 // entry point when this action is run from other actions
@@ -35,28 +44,35 @@ export async function setupRuby(options = {}) {
       inputs[key] = core.getInput(key) || inputDefaults[key]
     }
   }
+  common.inputs.selfHosted = inputs['self-hosted']
 
   process.chdir(inputs['working-directory'])
 
-  const platform = common.getVirtualEnvironmentName()
+  const platform = common.getOSNameVersion()
   const [engine, parsedVersion] = parseRubyEngineAndVersion(inputs['ruby-version'])
 
   let installer
-  if (platform.startsWith('windows-') && engine === 'ruby') {
+  if (platform.startsWith('windows-') && engine === 'ruby' && !common.isSelfHostedRunner()) {
     installer = require('./windows')
   } else {
     installer = require('./ruby-builder')
   }
 
-  const engineVersions = installer.getAvailableVersions(platform, engine)
-  const version = validateRubyEngineAndVersion(platform, engineVersions, engine, parsedVersion)
+  let version
+  if (common.isSelfHostedRunner()) {
+    // The list of available Rubies in the hostedtoolcache is unrelated to getAvailableVersions()
+    version = parsedVersion
+  } else {
+    const engineVersions = installer.getAvailableVersions(platform, engine)
+    version = validateRubyEngineAndVersion(platform, engineVersions, engine, parsedVersion)
+  }
 
   createGemRC(engine, version)
   envPreInstall()
 
   // JRuby can use compiled extension code, so make sure gcc exists.
   // As of Jan-2022, JRuby compiles against msvcrt.
-  if (platform.startsWith('windows') && (engine === 'jruby') && 
+  if (platform.startsWith('windows') && engine === 'jruby' &&
     !fs.existsSync('C:\\msys64\\mingw64\\bin\\gcc.exe')) {
     await require('./windows').installJRubyTools()
   }
@@ -69,7 +85,7 @@ export async function setupRuby(options = {}) {
   const rubygemsInputSet = inputs['rubygems'] !== 'default'
   if (rubygemsInputSet) {
     await common.measure('Updating RubyGems', async () =>
-      rubygems.rubygemsUpdate(inputs['rubygems'], rubyPrefix))
+      rubygems.rubygemsUpdate(inputs['rubygems'], rubyPrefix, platform, engine, version))
   }
 
   // When setup-ruby is used by other actions, this allows code in them to run
@@ -88,7 +104,7 @@ export async function setupRuby(options = {}) {
   }
 
   if (inputs['bundler-cache'] === 'true') {
-    await common.measure('bundle install', async () =>
+    await common.time('bundle install', async () =>
       bundler.bundleInstall(gemfile, lockFile, platform, engine, version, bundlerVersion, inputs['cache-version']))
   }
 
@@ -139,7 +155,7 @@ function validateRubyEngineAndVersion(platform, engineVersions, engine, parsedVe
   if (!engineVersions.includes(parsedVersion)) {
     const latestToFirstVersion = engineVersions.slice().reverse()
     // Try to match stable versions first, so an empty version (engine-only) matches the latest stable version
-    let found = latestToFirstVersion.find(v => common.isStableVersion(v) && v.startsWith(parsedVersion))
+    let found = latestToFirstVersion.find(v => common.isStableVersion(engine, v) && v.startsWith(parsedVersion))
     if (!found) {
       // Exclude head versions, they must be exact matches
       found = latestToFirstVersion.find(v => !common.isHeadVersion(v) && v.startsWith(parsedVersion))
@@ -149,10 +165,33 @@ function validateRubyEngineAndVersion(platform, engineVersions, engine, parsedVe
       version = found
     } else {
       throw new Error(`Unknown version ${parsedVersion} for ${engine} on ${platform}
-        available versions for ${engine} on ${platform}: ${engineVersions.join(', ')}
-        Make sure you use the latest version of the action with - uses: ruby/setup-ruby@v1
-        File an issue at https://github.com/ruby/setup-ruby/issues if you would like support for a new version`)
+        Available versions for ${engine} on ${platform}: ${engineVersions.join(', ')}
+        Make sure you use the latest version of the action with - uses: ruby/setup-ruby@v1`)
     }
+  }
+
+  // Well known version-platform combinations which do not work:
+  if (engine === 'ruby' && platform.startsWith('macos') && os.arch() === 'arm64' && common.floatVersion(version) < 2.6) {
+    throw new Error(`CRuby < 2.6 does not support macos-arm64.
+        Either use a newer Ruby version or use a macOS image running on amd64, e.g., macos-13.
+        Note that GitHub changed the meaning of macos-latest from macos-12 (amd64) to macos-14 (arm64):
+        https://github.blog/changelog/2024-04-01-macos-14-sonoma-is-generally-available-and-the-latest-macos-runner-image/
+
+        If you are using a matrix of Ruby versions, a good solution is to run only < 2.6 on amd64, like so:
+        matrix:
+          ruby: ['2.4', '2.5', '2.6', '2.7', '3.0', '3.1', '3.2', '3.3']
+          os: [ ubuntu-latest, macos-latest ]
+          # CRuby < 2.6 does not support macos-arm64, so test those on amd64 instead
+          exclude:
+          - { os: macos-latest, ruby: '2.4' }
+          - { os: macos-latest, ruby: '2.5' }
+          include:
+          - { os: macos-13, ruby: '2.4' }
+          - { os: macos-13, ruby: '2.5' }
+
+        But of course you should consider dropping support for these long-EOL Rubies, which cannot even be built on recent macOS machines.`)
+  } else if (engine === 'truffleruby' && platform.startsWith('windows')) {
+    throw new Error('TruffleRuby does not currently support Windows.')
   }
 
   return version

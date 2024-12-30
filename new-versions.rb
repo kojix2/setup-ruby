@@ -1,24 +1,24 @@
-engine_input, version = ARGV.fetch(0).split('-', 2)
+versions = ARGV.fetch(0).split(',').map(&:strip)
+p versions
 
-if engine_input == 'windows'
-  require_relative 'generate-windows-versions'
-  exit
-end
+versions.each do |engine_version|
+  puts engine_version
+  engine, version = engine_version.split('-', 2)
+  p [engine, version]
 
-MATCH = case engine_input
-when 'ruby', 'jruby'
-  /^\d+\.\d+\./
-when 'truffleruby'
-  /^\d+\./
-end
+  if engine == 'windows'
+    require_relative 'generate-windows-versions'
+    exit
+  end
 
-raise unless version[MATCH]
+  match = case engine
+  when 'ruby', 'jruby'
+    /^\d+\.\d+\./
+  when 'truffleruby', 'truffleruby+graalvm'
+    /^\d+\./
+  end
 
-engines = [engine_input]
-engines << 'truffleruby+graalvm' if engine_input == 'truffleruby'
-
-engines.each do |engine|
-  puts engine
+  raise engine_version unless version[match]
 
   # Update ruby-builder-versions.json
   file = "#{__dir__}/ruby-builder-versions.json"
@@ -35,7 +35,7 @@ engines.each do |engine|
   puts lines[from..to]
 
   release_line = lines[from..to].find { |line|
-    v = line[/"([^"]+)"/, 1] and v[MATCH] == version[MATCH]
+    v = line[/"([^"]+)"/, 1] and v[match] == version[match]
   }
 
   if release_line
@@ -51,7 +51,7 @@ engines.each do |engine|
   file = "#{__dir__}/README.md"
   lines = File.readlines(file)
   engine_line = lines.find { |line| line.start_with?("| `#{engine}`") }
-  engine_line.sub!(/(.+ (?:-|until)) (\d+(?:\.\d+)+)/) do
+  engine_line.sub!(/(.+ (?:-|until)) (\d+(?:\.\d+)+(?:-\w+)?)/) do
     if Gem::Version.new(version) > Gem::Version.new($2)
       "#{$1} #{version}"
     else
